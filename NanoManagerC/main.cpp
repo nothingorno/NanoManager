@@ -6,6 +6,7 @@
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <commctrl.h>
+#include <uxtheme.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <shellapi.h>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <format>
 #include <vector>
+#include <deque>
 #include <unordered_map>
 #include <algorithm>
 
@@ -22,32 +24,50 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "version.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 #ifndef I_GROUPID_NONE
 #define I_GROUPID_NONE -1
 #endif
+#ifndef LVS_EX_GROUPVIEW
+#define LVS_EX_GROUPVIEW 0x00010000
+#endif
+#ifndef LVGS_COLLAPSIBLE
+#define LVGS_COLLAPSIBLE 0x00000008
+#endif
+#ifndef LVM_INSERTGROUP
+#define LVM_INSERTGROUP (LVM_FIRST + 145)
+#endif
+#ifndef LVM_REMOVEALLGROUPS
+#define LVM_REMOVEALLGROUPS (LVM_FIRST + 160)
+#endif
+#ifndef LVM_ENABLEGROUPVIEW
+#define LVM_ENABLEGROUPVIEW (LVM_FIRST + 157)
+#endif
 
-// Custom Message for Thread-Safe UI Sync
+// Custom Messages
 constexpr UINT WM_TELEMETRY_UPDATED = WM_APP + 1;
 
 // Layout Constants
 constexpr int TITLEBAR_HEIGHT = 36;
 constexpr int MENUBAR_HEIGHT = 32;
 constexpr int TABBAR_HEIGHT = 42;
+constexpr int TASKBAR_TOOLBAR = 48;
 constexpr int BUTTON_WIDTH = 46;
 constexpr int RESIZE_BORDER = 6;
 
-// Dark Gray Color Palette
-constexpr COLORREF COL_BG_MAIN = RGB(30, 30, 35);
-constexpr COLORREF COL_BG_TITLEBAR = RGB(22, 22, 26);
-constexpr COLORREF COL_BG_MENUBAR = RGB(26, 26, 30);
-constexpr COLORREF COL_BG_TABBAR = RGB(34, 34, 40);
-constexpr COLORREF COL_BG_CARD = RGB(38, 38, 45);
-constexpr COLORREF COL_BORDER = RGB(48, 48, 56);
+// Fluent UI Dark Theme Color Palette
+constexpr COLORREF COL_BG_MAIN = RGB(24, 24, 28);
+constexpr COLORREF COL_BG_TITLEBAR = RGB(18, 18, 22);
+constexpr COLORREF COL_BG_MENUBAR = RGB(22, 22, 26);
+constexpr COLORREF COL_BG_TABBAR = RGB(28, 28, 34);
+constexpr COLORREF COL_BG_SIDEBAR = RGB(26, 26, 32);
+constexpr COLORREF COL_BG_CARD = RGB(32, 32, 40);
+constexpr COLORREF COL_BORDER = RGB(50, 50, 62);
 constexpr COLORREF COL_ACCENT = RGB(0, 120, 212);
-constexpr COLORREF COL_TEXT_PRIMARY = RGB(235, 235, 242);
-constexpr COLORREF COL_TEXT_MUTED = RGB(145, 145, 158);
-constexpr COLORREF COL_BTN_HOVER = RGB(45, 45, 52);
+constexpr COLORREF COL_TEXT_PRIMARY = RGB(245, 245, 250);
+constexpr COLORREF COL_TEXT_MUTED = RGB(155, 155, 170);
+constexpr COLORREF COL_BTN_HOVER = RGB(44, 44, 54);
 constexpr COLORREF COL_CLOSE_HOVER = RGB(232, 17, 35);
 
 // Native Segoe Fluent / MDL2 Glyphs
@@ -55,12 +75,17 @@ constexpr wchar_t GLYPH_MINIMIZE = L'\uE921';
 constexpr wchar_t GLYPH_MAXIMIZE = L'\uE922';
 constexpr wchar_t GLYPH_RESTORE = L'\uE923';
 constexpr wchar_t GLYPH_CLOSE = L'\uE8BB';
-constexpr wchar_t GLYPH_PERF = L'\uEECB'; // Performance / Chart Icon
-constexpr wchar_t GLYPH_TASKS = L'\uE8FD'; // TaskView / List Icon
+constexpr wchar_t GLYPH_WELCOME = L'\uE80F';
+constexpr wchar_t GLYPH_PERF = L'\uEC8F';
+constexpr wchar_t GLYPH_TASKS = L'\uE8FD';
+constexpr wchar_t GLYPH_CPU = L'\uE950';
+constexpr wchar_t GLYPH_RAM = L'\uE964';
 
-// Application Tabs
-enum class AppTab { Perf, Tasks };
-AppTab g_currentTab = AppTab::Perf;
+// Application Navigation
+enum class AppTab { Welcome, Perf, Tasks };
+enum class PerfSubTab { CPU, RAM };
+AppTab g_currentTab = AppTab::Welcome;
+PerfSubTab g_currentPerfSub = PerfSubTab::CPU;
 
 // Telemetry & Process State
 std::mutex g_telemetryMutex;
@@ -69,7 +94,11 @@ unsigned long long g_totalRamBytes = 0;
 unsigned long long g_availRamBytes = 0;
 DWORD g_memoryLoad = 0;
 
-// Animation smoothing state
+// Rolling historical graph buffers (last 60 data points)
+std::deque<float> g_cpuHistory(60, 0.0f);
+std::deque<float> g_ramHistory(60, 0.0f);
+
+// Animation smoothing
 float g_animCpu = 0.0f;
 float g_animRam = 0.0f;
 
@@ -99,6 +128,7 @@ std::wstring g_iconFontName = L"Segoe MDL2 Assets";
 bool g_helpMenuOpen = false;
 HWND g_hwndAbout = nullptr;
 HWND g_hwndListView = nullptr;
+HWND g_hwndEndTaskBtn = nullptr;
 HFONT g_hListFont = nullptr;
 
 // OS Version Helper
@@ -162,7 +192,7 @@ int GetProcessIconIndex(const std::wstring& fullPath, const std::wstring& exeNam
     return sfi.iIcon;
 }
 
-// Background Telemetry & Process Polling Thread
+// Background Telemetry Polling Thread
 void TelemetryThreadFunc(HWND hwnd) {
     ULARGE_INTEGER lastIdle = {}, lastKernel = {}, lastUser = {};
     FILETIME ftIdle, ftKernel, ftUser;
@@ -271,6 +301,13 @@ void TelemetryThreadFunc(HWND hwnd) {
             g_totalRamBytes = memInfo.ullTotalPhys;
             g_availRamBytes = memInfo.ullAvailPhys;
             g_memoryLoad = memInfo.dwMemoryLoad;
+
+            g_cpuHistory.pop_front();
+            g_cpuHistory.push_back(cpu);
+
+            g_ramHistory.pop_front();
+            g_ramHistory.push_back(static_cast<float>(memInfo.dwMemoryLoad));
+
             g_processList = std::move(tempProcesses);
         }
 
@@ -278,7 +315,7 @@ void TelemetryThreadFunc(HWND hwnd) {
     }
 }
 
-// Smooth ListView Update with Native Collapsible Tree Groups (3+ instances)
+// Update ListView with Native Collapsible Groups (3+ instances)
 void UpdateTaskListView() {
     if (!g_hwndListView || !IsWindowVisible(g_hwndListView)) return;
 
@@ -295,8 +332,8 @@ void UpdateTaskListView() {
 
     SendMessage(g_hwndListView, WM_SETREDRAW, FALSE, 0);
 
-    ListView_RemoveAllGroups(g_hwndListView);
-    ListView_EnableGroupView(g_hwndListView, TRUE);
+    SendMessageW(g_hwndListView, LVM_REMOVEALLGROUPS, 0, 0);
+    SendMessageW(g_hwndListView, LVM_ENABLEGROUPVIEW, TRUE, 0);
 
     int groupIDCounter = 1;
     std::unordered_map<std::wstring, int> groupMap;
@@ -321,7 +358,8 @@ void UpdateTaskListView() {
                 grp.pszHeader = const_cast<LPWSTR>(groupHeaderTitle.c_str());
                 grp.state = LVGS_COLLAPSIBLE | LVGS_NORMAL;
                 grp.uAlign = LVGA_HEADER_LEFT;
-                SendMessage(g_hwndListView, LVM_INSERTGROUP, -1, (LPARAM)&grp);
+
+                SendMessageW(g_hwndListView, LVM_INSERTGROUP, -1, (LPARAM)&grp);
             }
             else {
                 assignedGroupID = it->second;
@@ -389,7 +427,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     g_isWin11 = DetectWindows11();
     g_iconFontName = g_isWin11 ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets";
 
-    INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_LISTVIEW_CLASSES };
+    INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icex);
 
     const wchar_t* CLASS_NAME = L"NanoManagerC_MainFrame";
@@ -420,7 +458,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
         SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
 
-    int topOffset = TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT;
+    int topOffset = TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT + TASKBAR_TOOLBAR;
     g_hwndListView = CreateWindowExW(
         0, WC_LISTVIEWW, L"",
         WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL,
@@ -428,7 +466,12 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         hwnd, (HMENU)1001, hInstance, nullptr
     );
 
-    // Enabled LVS_EX_GROUPVIEW for collapsible task grouping support
+    // Apply Dark Mode theme to ListView header so column headers are dark instead of white
+    HWND hwndHeader = ListView_GetHeader(g_hwndListView);
+    if (hwndHeader) {
+        SetWindowTheme(hwndHeader, L"DarkMode_Explorer", nullptr);
+    }
+
     ListView_SetExtendedListViewStyle(g_hwndListView, LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_GROUPVIEW);
 
     ListView_SetBkColor(g_hwndListView, COL_BG_MAIN);
@@ -462,6 +505,16 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         ListView_SetImageList(g_hwndListView, hIml, LVSIL_SMALL);
     }
 
+    // Owner-drawn Fluent dark End Task button
+    g_hwndEndTaskBtn = CreateWindowExW(
+        0, L"BUTTON", L"End Task",
+        WS_CHILD | BS_OWNERDRAW,
+        16, TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT + 8, 110, 32,
+        hwnd, (HMENU)1002, hInstance, nullptr
+    );
+    SendMessage(g_hwndEndTaskBtn, WM_SETFONT, (WPARAM)g_hListFont, TRUE);
+    ShowWindow(g_hwndEndTaskBtn, SW_HIDE);
+
     std::thread telemetryThread(TelemetryThreadFunc, hwnd);
     telemetryThread.detach();
 
@@ -493,7 +546,7 @@ LRESULT CALLBACK AboutWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
         SelectObject(hdc, hFontTitle);
         SetTextColor(hdc, COL_TEXT_PRIMARY);
-        TextOutW(hdc, 24, 24, L"NanoManager v3.0", 16);
+        TextOutW(hdc, 24, 24, L"NanoManager v3.0 Pre-Release", 28);
 
         SelectObject(hdc, hFontBody);
         SetTextColor(hdc, COL_TEXT_MUTED);
@@ -530,6 +583,57 @@ HoveredButton HitTestTitleBarButtons(HWND hwnd, POINT ptClient) {
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT pDis = (LPDRAWITEMSTRUCT)lParam;
+        if (pDis->CtlID == 1002) { // Fluent Rounded Custom Dark End Task Button
+            HDC hdc = pDis->hDC;
+            RECT rc = pDis->rcItem;
+            bool isHovered = (pDis->itemState & ODS_SELECTED) || (pDis->itemState & ODS_FOCUS);
+
+            HBRUSH hBr = CreateSolidBrush(isHovered ? RGB(55, 55, 68) : COL_BG_CARD);
+            HBRUSH hBorderBr = CreateSolidBrush(COL_BORDER);
+
+            HGDIOBJ oldBrush = SelectObject(hdc, hBr);
+            HGDIOBJ oldPen = SelectObject(hdc, CreatePen(PS_SOLID, 1, COL_BORDER));
+
+            RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
+
+            SelectObject(hdc, oldBrush);
+            DeleteObject(hBr);
+            DeleteObject(hBorderBr);
+
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COL_TEXT_PRIMARY);
+
+            HFONT hBtnFont = CreateFontW(14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+            HGDIOBJ hOldFont = SelectObject(hdc, hBtnFont);
+            DrawTextW(hdc, L"End Task", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(hdc, hOldFont);
+            DeleteObject(hBtnFont);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_COMMAND: {
+        if (LOWORD(wParam) == 1002) {
+            int selectedIndex = ListView_GetNextItem(g_hwndListView, -1, LVNI_SELECTED);
+            if (selectedIndex != -1) {
+                wchar_t pidBuf[64] = {};
+                ListView_GetItemText(g_hwndListView, selectedIndex, 2, pidBuf, 64);
+                DWORD pid = wcstoul(pidBuf, nullptr, 10);
+                if (pid > 0) {
+                    HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                    if (hProc) {
+                        TerminateProcess(hProc, 0);
+                        CloseHandle(hProc);
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
     case WM_TIMER: {
         if (wParam == 1 && g_currentTab == AppTab::Perf) {
             float targetCpu = 0.0f;
@@ -605,7 +709,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_SIZE: {
         int width = LOWORD(lParam);
         int height = HIWORD(lParam);
-        int topOffset = TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT;
+        int topOffset = TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT + TASKBAR_TOOLBAR;
         if (g_hwndListView) {
             SetWindowPos(g_hwndListView, nullptr, 0, topOffset, width, height - topOffset, SWP_NOZORDER);
 
@@ -662,32 +766,53 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            else if (g_helpMenuOpen) {
-                if (pt.x >= 16 && pt.x <= 180 && pt.y >= TITLEBAR_HEIGHT + MENUBAR_HEIGHT && pt.y <= TITLEBAR_HEIGHT + MENUBAR_HEIGHT + 36) {
-                    CreateAboutWindow(GetModuleHandle(nullptr), hwnd);
-                }
-                g_helpMenuOpen = false;
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
+        }
+        else if (g_helpMenuOpen) {
+            if (pt.x >= 16 && pt.x <= 200 && pt.y >= TITLEBAR_HEIGHT + MENUBAR_HEIGHT && pt.y <= TITLEBAR_HEIGHT + MENUBAR_HEIGHT + 40) {
+                CreateAboutWindow(GetModuleHandle(nullptr), hwnd);
             }
+            g_helpMenuOpen = false;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
         }
         else if (pt.y >= TITLEBAR_HEIGHT + MENUBAR_HEIGHT && pt.y < TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT) {
             g_helpMenuOpen = false;
-            if (pt.x >= 16 && pt.x < 130 && g_currentTab != AppTab::Perf) {
-                g_currentTab = AppTab::Perf;
+            if (pt.x >= 16 && pt.x < 116 && g_currentTab != AppTab::Welcome) {
+                g_currentTab = AppTab::Welcome;
                 ShowWindow(g_hwndListView, SW_HIDE);
+                ShowWindow(g_hwndEndTaskBtn, SW_HIDE);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
-            else if (pt.x >= 130 && pt.x < 250 && g_currentTab != AppTab::Tasks) {
+            else if (pt.x >= 116 && pt.x < 216 && g_currentTab != AppTab::Perf) {
+                g_currentTab = AppTab::Perf;
+                ShowWindow(g_hwndListView, SW_HIDE);
+                ShowWindow(g_hwndEndTaskBtn, SW_HIDE);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            else if (pt.x >= 216 && pt.x < 316 && g_currentTab != AppTab::Tasks) {
                 g_currentTab = AppTab::Tasks;
                 ShowWindow(g_hwndListView, SW_SHOW);
+                ShowWindow(g_hwndEndTaskBtn, SW_SHOW);
                 UpdateTaskListView();
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
         }
-        else if (g_helpMenuOpen) {
-            g_helpMenuOpen = false;
-            InvalidateRect(hwnd, nullptr, FALSE);
+        else if (g_currentTab == AppTab::Perf && pt.y >= TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT && pt.x < 180) {
+            int subSidebarY = pt.y - (TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT);
+            if (subSidebarY >= 20 && subSidebarY < 70) {
+                g_currentPerfSub = PerfSubTab::CPU;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            else if (subSidebarY >= 75 && subSidebarY < 125) {
+                g_currentPerfSub = PerfSubTab::RAM;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        }
+        else {
+            if (g_helpMenuOpen) {
+                g_helpMenuOpen = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         }
         return 0;
     }
@@ -758,7 +883,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         SelectObject(hdcMem, hTitleFont);
         SetTextColor(hdcMem, COL_TEXT_PRIMARY);
         RECT rcTitleText = { 16, 0, width - BUTTON_WIDTH * 3, TITLEBAR_HEIGHT };
-        DrawTextW(hdcMem, L"NanoManager v3", -1, &rcTitleText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(hdcMem, L"NanoManager v3 (Pre-Release)", -1, &rcTitleText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
         SelectObject(hdcMem, hIconFont);
         auto drawGlyphButton = [&](int indexFromRight, HoveredButton btnType, wchar_t glyph, COLORREF hoverCol) {
@@ -785,9 +910,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
         DrawTextW(hdcMem, L"Help", -1, &rcHelpBtn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-        // Render Tabs with Segoe Fluent/MDL2 Icons + Text
         auto drawTabItem = [&](int x, wchar_t icon, const wchar_t* label, AppTab tab) {
-            RECT rcT = { x, TITLEBAR_HEIGHT + MENUBAR_HEIGHT, x + 114, TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT };
+            RECT rcT = { x, TITLEBAR_HEIGHT + MENUBAR_HEIGHT, x + 100, TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT };
             bool active = (g_currentTab == tab);
             if (active) {
                 HBRUSH hActiveBrush = CreateSolidBrush(COL_BG_MAIN);
@@ -799,95 +923,198 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 SetTextColor(hdcMem, COL_TEXT_MUTED);
             }
 
-            // Draw Icon
             SelectObject(hdcMem, hIconFont);
             wchar_t iconStr[2] = { icon, L'\0' };
-            RECT rcIcon = { rcT.left + 12, rcT.top, rcT.left + 36, rcT.bottom };
+            RECT rcIcon = { rcT.left + 10, rcT.top, rcT.left + 30, rcT.bottom };
             DrawTextW(hdcMem, iconStr, 1, &rcIcon, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-            // Draw Label
             SelectObject(hdcMem, hTabFont);
-            RECT rcLabel = { rcT.left + 36, rcT.top, rcT.right, rcT.bottom };
+            RECT rcLabel = { rcT.left + 30, rcT.top, rcT.right, rcT.bottom };
             DrawTextW(hdcMem, label, -1, &rcLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             };
-        drawTabItem(16, GLYPH_PERF, L"Perf", AppTab::Perf);
-        drawTabItem(130, GLYPH_TASKS, L"Tasks", AppTab::Tasks);
+        drawTabItem(16, GLYPH_WELCOME, L"Welcome", AppTab::Welcome);
+        drawTabItem(116, GLYPH_PERF, L"Perf", AppTab::Perf);
+        drawTabItem(216, GLYPH_TASKS, L"Tasks", AppTab::Tasks);
 
-        if (g_currentTab == AppTab::Perf) {
+        // Welcome Tab Dashboard View with Fluent Rounded Cards
+        if (g_currentTab == AppTab::Welcome) {
+            int topOffset = TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT + 24;
+
+            RECT rcWelcomeCard = { 40, topOffset, width - 40, height - 60 };
+            HBRUSH cardBr = CreateSolidBrush(COL_BG_CARD);
+            HBRUSH borderBr = CreateSolidBrush(COL_BORDER);
+
+            HGDIOBJ oldBr = SelectObject(hdcMem, cardBr);
+            HGDIOBJ oldP = SelectObject(hdcMem, CreatePen(PS_SOLID, 1, COL_BORDER));
+            RoundRect(hdcMem, rcWelcomeCard.left, rcWelcomeCard.top, rcWelcomeCard.right, rcWelcomeCard.bottom, 16, 16);
+            SelectObject(hdcMem, oldBr);
+            DeleteObject(cardBr);
+            DeleteObject(borderBr);
+
+            SelectObject(hdcMem, hValueFont);
+            SetTextColor(hdcMem, COL_TEXT_PRIMARY);
+            TextOutW(hdcMem, 75, topOffset + 40, L"Welcome to NanoManager v3", 25);
+
+            SelectObject(hdcMem, hCardFont);
+            SetTextColor(hdcMem, COL_TEXT_MUTED);
+            TextOutW(hdcMem, 75, topOffset + 85, L"High-Performance Monolithic Win32 Telemetry & Process Controller", 61);
+
+            auto drawMiniStatCard = [&](int x, int y, int w, int h, const wchar_t* title, const std::wstring& val) {
+                RECT rcS = { x, y, x + w, y + h };
+                HBRUSH sBr = CreateSolidBrush(RGB(40, 40, 50));
+                HBRUSH sBrd = CreateSolidBrush(COL_BORDER);
+
+                HGDIOBJ oBr = SelectObject(hdcMem, sBr);
+                HGDIOBJ oP = SelectObject(hdcMem, CreatePen(PS_SOLID, 1, COL_BORDER));
+                RoundRect(hdcMem, rcS.left, rcS.top, rcS.right, rcS.bottom, 12, 12);
+                SelectObject(hdcMem, oBr);
+                DeleteObject(sBr);
+                DeleteObject(sBrd);
+
+                SelectObject(hdcMem, hCardFont);
+                SetTextColor(hdcMem, COL_TEXT_MUTED);
+                RECT rcSt = { x + 16, y + 14, x + w - 16, y + 36 };
+                DrawTextW(hdcMem, title, -1, &rcSt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+                SelectObject(hdcMem, hValueFont);
+                SetTextColor(hdcMem, COL_TEXT_PRIMARY);
+                RECT rcSv = { x + 16, y + 42, x + w - 16, y + 84 };
+                DrawTextW(hdcMem, val.c_str(), -1, &rcSv, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                };
+
             unsigned long long totalRam, availRam;
+            float curCpu;
             {
                 std::lock_guard<std::mutex> lock(g_telemetryMutex);
                 totalRam = g_totalRamBytes;
                 availRam = g_availRamBytes;
+                curCpu = g_cpuUsage;
             }
 
-            auto drawTelemetryCard = [&](int x, int y, int w, int h, const wchar_t* title, float percent, const std::wstring& details) {
-                RECT rcCard = { x, y, x + w, y + h };
-                HBRUSH cardBrush = CreateSolidBrush(COL_BG_CARD);
-                FillRect(hdcMem, &rcCard, cardBrush);
-                DeleteObject(cardBrush);
+            double usedGB = (double)(totalRam - availRam) / (1024.0 * 1024.0 * 1024.0);
+            double totalGB = (double)totalRam / (1024.0 * 1024.0 * 1024.0);
 
-                HBRUSH brBorder = CreateSolidBrush(COL_BORDER);
-                FrameRect(hdcMem, &rcCard, brBorder);
-                DeleteObject(brBorder);
+            drawMiniStatCard(75, topOffset + 140, 300, 110, L"Active Processor Load", std::format(L"{:.1f}%", curCpu));
+            drawMiniStatCard(395, topOffset + 140, 300, 110, L"Physical RAM Usage", std::format(L"{:.1f} / {:.1f} GB", usedGB, totalGB));
+        }
+
+        // Perf Tab View with Fluent Rounded Cards & 100% Dark Graph Plotting
+        if (g_currentTab == AppTab::Perf) {
+            int topOffset = TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT;
+
+            RECT rcSidebar = { 0, topOffset, 180, height };
+            HBRUSH sbBrush = CreateSolidBrush(COL_BG_SIDEBAR);
+            FillRect(hdcMem, &rcSidebar, sbBrush);
+            DeleteObject(sbBrush);
+
+            HPEN sbBorderPen = CreatePen(PS_SOLID, 1, COL_BORDER);
+            SelectObject(hdcMem, sbBorderPen);
+            MoveToEx(hdcMem, 180, topOffset, nullptr);
+            LineTo(hdcMem, 180, height);
+            DeleteObject(sbBorderPen);
+
+            auto drawSubNavItem = [&](int y, wchar_t icon, const wchar_t* title, PerfSubTab sub) {
+                RECT rcItem = { 12, topOffset + y, 168, topOffset + y + 45 };
+                bool active = (g_currentPerfSub == sub);
+                if (active) {
+                    HBRUSH actBrush = CreateSolidBrush(COL_BG_CARD);
+                    HGDIOBJ oBr = SelectObject(hdcMem, actBrush);
+                    HGDIOBJ oP = SelectObject(hdcMem, CreatePen(PS_SOLID, 1, COL_BORDER));
+                    RoundRect(hdcMem, rcItem.left, rcItem.top, rcItem.right, rcItem.bottom, 8, 8);
+                    SelectObject(hdcMem, oBr);
+                    DeleteObject(actBrush);
+                    SetTextColor(hdcMem, COL_TEXT_PRIMARY);
+                }
+                else {
+                    SetTextColor(hdcMem, COL_TEXT_MUTED);
+                }
+
+                SelectObject(hdcMem, hIconFont);
+                wchar_t ic[2] = { icon, L'\0' };
+                RECT rcIC = { rcItem.left + 10, rcItem.top, rcItem.left + 30, rcItem.bottom };
+                DrawTextW(hdcMem, ic, 1, &rcIC, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+                SelectObject(hdcMem, hTabFont);
+                RECT rcTxt = { rcItem.left + 35, rcItem.top, rcItem.right, rcItem.bottom };
+                DrawTextW(hdcMem, title, -1, &rcTxt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                };
+
+            drawSubNavItem(20, GLYPH_CPU, L"CPU", PerfSubTab::CPU);
+            drawSubNavItem(75, GLYPH_RAM, L"RAM", PerfSubTab::RAM);
+
+            int graphX = 210;
+            int graphY = topOffset + 24;
+            int graphW = width - 240;
+            int graphH = height - topOffset - 60;
+            if (graphW > 300 && graphH > 200) {
+                RECT rcGraphCard = { graphX, graphY, graphX + graphW, graphY + graphH };
+
+                // Fluent Rounded Main Graph Card
+                HBRUSH cardBrush = CreateSolidBrush(COL_BG_CARD);
+                HGDIOBJ oBr = SelectObject(hdcMem, cardBrush);
+                HGDIOBJ oP = SelectObject(hdcMem, CreatePen(PS_SOLID, 1, COL_BORDER));
+                RoundRect(hdcMem, rcGraphCard.left, rcGraphCard.top, rcGraphCard.right, rcGraphCard.bottom, 16, 16);
+                SelectObject(hdcMem, oBr);
+                DeleteObject(cardBrush);
 
                 SelectObject(hdcMem, hCardFont);
                 SetTextColor(hdcMem, COL_TEXT_PRIMARY);
-                RECT rcHeader = { x + 20, y + 16, x + w - 20, y + 40 };
-                DrawTextW(hdcMem, title, -1, &rcHeader, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                std::wstring headerTitle = (g_currentPerfSub == PerfSubTab::CPU) ? L"Processor (CPU) — Live Telemetry" : L"Memory (RAM) — Usage History";
+                RECT rcGH = { graphX + 24, graphY + 20, graphX + graphW - 24, graphY + 50 };
+                DrawTextW(hdcMem, headerTitle.c_str(), -1, &rcGH, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
                 SelectObject(hdcMem, hValueFont);
-                std::wstring percStr = std::format(L"{:.1f}%", percent);
-                RECT rcVal = { x + 20, y + 45, x + w - 20, y + 85 };
-                DrawTextW(hdcMem, percStr.c_str(), -1, &rcVal, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                float curVal = (g_currentPerfSub == PerfSubTab::CPU) ? g_animCpu : g_animRam;
+                std::wstring valStr = std::format(L"{:.1f}%", curVal);
+                RECT rcGV = { graphX + 24, graphY + 55, graphX + 200, graphY + 95 };
+                DrawTextW(hdcMem, valStr.c_str(), -1, &rcGV, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-                RECT rcBarBg = { x + 20, y + 105, x + w - 20, y + 115 };
-                HBRUSH bgBarBrush = CreateSolidBrush(RGB(50, 50, 60));
-                FillRect(hdcMem, &rcBarBg, bgBarBrush);
-                DeleteObject(bgBarBrush);
+                int plotX = graphX + 24;
+                int plotY = graphY + 120;
+                int plotW = graphW - 48;
+                int plotH = graphH - 150;
 
-                int fillWidth = static_cast<int>((w - 40) * (percent / 100.0f));
-                if (fillWidth > w - 40) fillWidth = w - 40;
-                if (fillWidth < 0) fillWidth = 0;
-                if (fillWidth > 0) {
-                    RECT rcBarFill = { x + 20, y + 105, x + 20 + fillWidth, y + 115 };
-                    HBRUSH fillBrush = CreateSolidBrush(COL_ACCENT);
-                    FillRect(hdcMem, &rcBarFill, fillBrush);
-                    DeleteObject(fillBrush);
+                // 100% Dark Theme Graph Plot Viewport with Rounded Corners
+                RECT rcPlotBox = { plotX, plotY, plotX + plotW, plotY + plotH };
+                HBRUSH plotBgBr = CreateSolidBrush(RGB(18, 18, 22));
+                HGDIOBJ oPBr = SelectObject(hdcMem, plotBgBr);
+                HGDIOBJ oPPen = SelectObject(hdcMem, CreatePen(PS_SOLID, 1, RGB(60, 60, 75)));
+                RoundRect(hdcMem, rcPlotBox.left, rcPlotBox.top, rcPlotBox.right, rcPlotBox.bottom, 10, 10);
+                SelectObject(hdcMem, oPBr);
+                DeleteObject(plotBgBr);
+
+                const auto& history = (g_currentPerfSub == PerfSubTab::CPU) ? g_cpuHistory : g_ramHistory;
+                if (history.size() > 1) {
+                    HPEN linePen = CreatePen(PS_SOLID, 2, COL_ACCENT);
+                    SelectObject(hdcMem, linePen);
+
+                    int ptsCount = static_cast<int>(history.size());
+                    std::vector<POINT> pts(ptsCount);
+                    for (int i = 0; i < ptsCount; ++i) {
+                        float val = history[i];
+                        val = std::clamp(val, 0.0f, 100.0f);
+                        int px = plotX + 10 + ((i * (plotW - 20)) / (ptsCount - 1));
+                        int py = (plotY + plotH - 10) - static_cast<int>((val / 100.0f) * (plotH - 20));
+                        pts[i] = { px, py };
+                    }
+                    Polyline(hdcMem, pts.data(), ptsCount);
+                    DeleteObject(linePen);
                 }
-
-                SelectObject(hdcMem, hMenuFont);
-                SetTextColor(hdcMem, COL_TEXT_MUTED);
-                RECT rcDetails = { x + 20, y + 130, x + w - 20, y + 155 };
-                DrawTextW(hdcMem, details.c_str(), -1, &rcDetails, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-                };
-
-            int cardWidth = (width - 72) / 2;
-            int cardHeight = 180;
-            int cardY = TITLEBAR_HEIGHT + MENUBAR_HEIGHT + TABBAR_HEIGHT + 24;
-
-            double usedRamGB = (double)(totalRam - availRam) / (1024.0 * 1024.0 * 1024.0);
-            double totalRamGB = (double)totalRam / (1024.0 * 1024.0 * 1024.0);
-            std::wstring ramDetails = std::format(L"Used: {:.2f} GB / Total: {:.2f} GB", usedRamGB, totalRamGB);
-            std::wstring cpuDetails = L"Monolithic Core Telemetry Polling Active";
-
-            drawTelemetryCard(24, cardY, cardWidth, cardHeight, L"Processor (CPU)", g_animCpu, cpuDetails);
-            drawTelemetryCard(cardWidth + 48, cardY, cardWidth, cardHeight, L"Memory (RAM)", g_animRam, ramDetails);
+            }
         }
 
         if (g_helpMenuOpen) {
-            RECT rcPopup = { 16, TITLEBAR_HEIGHT + MENUBAR_HEIGHT, 180, TITLEBAR_HEIGHT + MENUBAR_HEIGHT + 40 };
+            RECT rcPopup = { 16, TITLEBAR_HEIGHT + MENUBAR_HEIGHT, 200, TITLEBAR_HEIGHT + MENUBAR_HEIGHT + 42 };
             HBRUSH popupBrush = CreateSolidBrush(COL_BG_CARD);
-            FillRect(hdcMem, &rcPopup, popupBrush);
+            HGDIOBJ oBr = SelectObject(hdcMem, popupBrush);
+            HGDIOBJ oP = SelectObject(hdcMem, CreatePen(PS_SOLID, 1, COL_BORDER));
+            RoundRect(hdcMem, rcPopup.left, rcPopup.top, rcPopup.right, rcPopup.bottom, 8, 8);
+            SelectObject(hdcMem, oBr);
             DeleteObject(popupBrush);
-
-            HBRUSH brPopupBorder = CreateSolidBrush(COL_BORDER);
-            FrameRect(hdcMem, &rcPopup, brPopupBorder);
-            DeleteObject(brPopupBorder);
 
             SelectObject(hdcMem, hMenuFont);
             SetTextColor(hdcMem, COL_TEXT_PRIMARY);
-            RECT rcItem = { 26, TITLEBAR_HEIGHT + MENUBAR_HEIGHT, 170, TITLEBAR_HEIGHT + MENUBAR_HEIGHT + 40 };
+            RECT rcItem = { 26, TITLEBAR_HEIGHT + MENUBAR_HEIGHT, 190, TITLEBAR_HEIGHT + MENUBAR_HEIGHT + 42 };
             DrawTextW(hdcMem, L"About NanoManager", -1, &rcItem, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
 
